@@ -4,6 +4,8 @@ from models import LogEntry, RequestVote, VoteResponse, AppendEntries, AppendEnt
 import argparse
 import socket
 from threading import Thread
+import json
+from dataclasses import asdict
 
 @dataclass
 class Node:
@@ -27,11 +29,43 @@ class Node:
         
         while True:
             conn, addr = self.server.accept()
-            t = Thread(target = self.handle_client, args = (conn, addr))
+            t = Thread(target = self.handle_connection, args = (conn, addr), daemon = True)
             t.start()
 
     def handle_connection(self, conn, addr):
-        pass
+        try:
+            while True:
+                msg_len = int(conn.recv(128).decode())
+                msg = json.loads(conn.recv(msg_len).decode())
+                self.process_msg(msg)
+        except:
+            conn.close()
+
+    def send_message(self, conn, msg):
+        name = type(msg).__name__
+        msg = asdict(msg)
+        msg["type"] = name
+        msg = json.dumps(msg)
+        length = len(msg)
+        length_to_send = (str(length) + (128 - len(str(length))) * " ").encode()
+        conn.send(length_to_send)
+        conn.send(msg.encode())
+
+    def process_msg(self, msg):
+        msg_type = msg["type"]
+        print(msg_type)
+        match msg_type:
+            case "RequestVote":
+                pass
+            case "VoteResponse":
+                pass
+            case "AppendEntries":
+                pass
+            case "AppendEntriesResponse":
+                pass
+            case "ClientCommand":
+                pass
+
 
 
 if __name__ == "__main__":
@@ -39,5 +73,5 @@ if __name__ == "__main__":
     parser.add_argument("--id", type = int, help = "ID of the node you want to create")
     args = parser.parse_args()
     node = Node(id=args.id)
-    print(f"Kreiran node sa id: {node.id}, state = {node.state}, term = {node.current_term}")
+    print(f"Created node with id: {node.id}, state = {node.state}, term = {node.current_term}")
     node.start()
