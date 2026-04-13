@@ -7,6 +7,7 @@ from threading import Thread, Event
 import json
 from dataclasses import asdict
 import random
+import time
 
 @dataclass
 class Node:
@@ -32,6 +33,9 @@ class Node:
 
         election = Thread(target = self.election_loop, daemon = True)
         election.start()
+
+        heartbeat = Thread(target=self.heartbeat_loop, daemon=True)
+        heartbeat.start()
         
         while True:
             conn, addr = self.server.accept()
@@ -59,14 +63,30 @@ class Node:
 
     def process_msg(self, msg):
         msg_type = msg["type"]
-        print(msg_type)
         match msg_type:
             case "RequestVote":
                 self.vote(msg)
             case "VoteResponse":
-                pass
+                vote_term = msg["term"]
+                if vote_term > self.current_term:
+                    self.current_term = vote_term
+                    self.state = "follower"
+                    self.voted_for = None
+                    return
+                vote_response = msg["response"]
+                if vote_response:
+                    self.voted_for_me_total += 1
+                if self.voted_for_me_total > len(CLUSTER) // 2:
+                    self.state = "leader"
+                    self.leader_id = self.id
+                    self.heartbeat_event.set()  # resetuj election timeout
+                    print(f"Node {self.id} je postao LIDER u term-u {self.current_term}")
             case "AppendEntries":
-                pass
+                if msg["term"] >= self.current_term:
+                    self.heartbeat_event.set()
+                    self.state = "follower"
+                    self.leader_id = msg["leader_id"]
+                    self.current_term = msg["term"]
             case "AppendEntriesResponse":
                 pass
             case "ClientCommand":
@@ -74,6 +94,9 @@ class Node:
 
     def election_loop(self):
         while True:
+            if self.state == "leader":
+                time.sleep(0.05)
+                continue
             timeout = random.uniform(0.15, 0.3)
             heartbeat_received = self.heartbeat_event.wait(timeout)
             if heartbeat_received:
@@ -89,41 +112,82 @@ class Node:
                     last_log_term = 0
 
                 self.state = "candidate"
+                print(f"Kandidujem se: {self.id}")
                 self.voted_for = self.id
+                self.voted_for_me_total = 1
                 req = RequestVote(node_id = self.id, term = self.current_term, last_log_index = last_log_index, last_log_term = last_log_term)
 
                 for i in CLUSTER:
-                    if i != self.id:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.connect(CLUSTER[i])
-                        self.send_message(sock, req)
+                    try:
+                        if i != self.id:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.connect(CLUSTER[i])
+                            self.send_message(sock, req)
+                    except:
+                        pass
 
-        def vote(self, msg):
-            my_vote = VoteResponse(node_id=self.id, term=self.current_term, response=False)
-            vote_term = msg["term"]
-            vote_last_log_index = msg["last_log_index"]
-            vote_last_log_term = msg["last_log_term"]
-            if vote_term < self.current_term:
+    def vote(self, msg):
+        my_vote = VoteResponse(node_id=self.id, term=self.current_term, response=False)
+        vote_term = msg["term"]
+        vote_last_log_index = msg["last_log_index"]
+        vote_last_log_term = msg["last_log_term"]
+        if vote_term < self.current_term:
+            my_vote.response = False
+        elif vote_term == self.current_term:
+            if self.voted_for == None:
+                self.voted_for = msg["node_id"]
+                my_vote.response = True
+            else:
                 my_vote.response = False
-            elif vote_term == self.current_term:
-                if self.voted_for == None:
+        else:
+            if self.log:
+                my_last_index = self.log[-1].index
+                my_last_term = self.log[-1].term
+
+                if (my_last_index > vote_last_log_index) or (my_last_term > vote_last_log_term):
+                    my_vote.response = False
+                else:
+                    self.state = "follower"
+                    self.current_term = vote_term
                     self.voted_for = msg["node_id"]
                     my_vote.response = True
-                else:
-                    my_vote.response = False
+
             else:
                 self.state = "follower"
                 self.current_term = vote_term
                 self.voted_for = msg["node_id"]
-                my_vote.response = True
+                my_vote.response = True             
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(CLUSTER[msg["node_id"]])
-            self.send_message(sock, my_vote)
+        print(f"Moj glas za {msg["node_id"]} je {my_vote.response}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(CLUSTER[msg["node_id"]])
+        self.send_message(sock, my_vote)
 
+    def heartbeat_loop(self):
+        while True:
+            if self.state == "leader":
+                heartbeat = AppendEntries(leader_id = self.id, term = self.current_term)
+                if self.log:
+                    heartbeat.prev_log_index = self.log[-1].index
+                    heartbeat.prev_log_term = self.log[-1].term
 
+                heartbeat.leader_commit = self.commit_index
 
+                for i in CLUSTER:
+                    try:
+                        if i != self.id:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.connect(CLUSTER[i])
+                            self.send_message(sock, heartbeat)
+                    except:
+                        pass
 
+                time.sleep(0.05)
+
+            else:
+                time.sleep(0.05)
+                continue
+        
 
 
 if __name__ == "__main__":
