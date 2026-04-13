@@ -3,14 +3,16 @@ from config import CLUSTER
 from models import LogEntry, RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse
 import argparse
 import socket
-from threading import Thread
+from threading import Thread, Event
 import json
 from dataclasses import asdict
+import random
 
 @dataclass
 class Node:
     """All the elements that a node needs, regardless if it is a leader or a follower"""
     id: int
+    heartbeat_event: Event = field(default_factory = Event)
     leader_id: int = None
     current_term: int = 0
     state: str = "follower"
@@ -19,6 +21,7 @@ class Node:
     log: list = field(default_factory = list)
     store: dict = field(default_factory = dict)
     next_index: dict = field(default_factory = dict)
+    voted_for_me_total: int = 0
     voted_for: int = None
 
     def start(self):
@@ -26,6 +29,9 @@ class Node:
         ADRESA = CLUSTER[self.id]
         self.server.bind(ADRESA)
         self.server.listen()
+
+        election = Thread(target = self.election_loop, daemon = True)
+        election.start()
         
         while True:
             conn, addr = self.server.accept()
@@ -56,7 +62,7 @@ class Node:
         print(msg_type)
         match msg_type:
             case "RequestVote":
-                pass
+                self.vote(msg)
             case "VoteResponse":
                 pass
             case "AppendEntries":
@@ -65,6 +71,58 @@ class Node:
                 pass
             case "ClientCommand":
                 pass
+
+    def election_loop(self):
+        while True:
+            timeout = random.uniform(0.15, 0.3)
+            heartbeat_received = self.heartbeat_event.wait(timeout)
+            if heartbeat_received:
+                self.heartbeat_event.clear()
+                continue
+            else:
+                self.current_term += 1
+                if self.log:
+                    last_log_index = self.log[-1].index
+                    last_log_term = self.log[-1].term
+                else:
+                    last_log_index = 0
+                    last_log_term = 0
+
+                self.state = "candidate"
+                self.voted_for = self.id
+                req = RequestVote(node_id = self.id, term = self.current_term, last_log_index = last_log_index, last_log_term = last_log_term)
+
+                for i in CLUSTER:
+                    if i != self.id:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.connect(CLUSTER[i])
+                        self.send_message(sock, req)
+
+        def vote(self, msg):
+            my_vote = VoteResponse(node_id=self.id, term=self.current_term, response=False)
+            vote_term = msg["term"]
+            vote_last_log_index = msg["last_log_index"]
+            vote_last_log_term = msg["last_log_term"]
+            if vote_term < self.current_term:
+                my_vote.response = False
+            elif vote_term == self.current_term:
+                if self.voted_for == None:
+                    self.voted_for = msg["node_id"]
+                    my_vote.response = True
+                else:
+                    my_vote.response = False
+            else:
+                self.state = "follower"
+                self.current_term = vote_term
+                self.voted_for = msg["node_id"]
+                my_vote.response = True
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(CLUSTER[msg["node_id"]])
+            self.send_message(sock, my_vote)
+
+
+
 
 
 
