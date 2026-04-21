@@ -27,14 +27,15 @@ class VoteResponse:
 class AppendEntries:
     leader_id: int
     term: int
-    prev_log_index: int
-    prev_log_term: int
-    leader_commit: int
+    prev_log_index: int = 0
+    prev_log_term: int = 0
+    leader_commit: int = 0
     entries: list = field(default_factory = list)
 
 """The response of each follower node to the request of committing the entries"""
 @dataclass
 class AppendEntriesResponse:
-    success: bool
-    term: int
-
+    node_id: int
+    success: bool = False
+    term: int = 0
+    last_log_index: int = 0
