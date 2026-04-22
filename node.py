@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from queue import Queue
 from config import CLUSTER
 from models import LogEntry, RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse
 import argparse
@@ -26,6 +27,7 @@ class Node:
     match_index: dict = field(default_factory = dict)
     voted_for_me_total: int = 0
     voted_for: int = None
+    peer_queues: dict = field(default_factory = dict)
 
     def start(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -41,11 +43,55 @@ class Node:
 
         apply_loop = Thread(target = self.handle_commits, daemon = True)
         apply_loop.start()
+
+        for id in CLUSTER.keys():
+            if id != self.id:
+                message_que = Queue()
+                self.peer_queues[id] = message_que
+                queue_thread = Thread(target = self.handle_queue, args=(id, message_que), daemon = True)
+                queue_thread.start()
         
         while True:
             conn, addr = self.server.accept()
             t = Thread(target = self.handle_connection, args = (conn, addr), daemon = True)
             t.start()
+
+    def handle_queue(self, id, message_que):
+        while True:
+            conn = self.establish_connection(id)
+
+            if conn is None:
+                time.sleep(0.1)
+                continue
+
+            print(f"Connected to the node: {id}")
+
+            try:
+                self.send_queue_messages(conn, message_que)
+            except:
+                print(f"Lost the connection to the node: {id}")
+                try:
+                    conn.close()
+                except:
+                    pass
+                finally:
+                    continue
+
+    def establish_connection(self, id):
+        peer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        try:
+            peer.settimeout(0.1)
+            peer.connect(CLUSTER[id])
+            peer.settimeout(None)
+            return peer
+        except:
+            return None
+        
+    def send_queue_messages(self, conn, message_que):
+        while True:
+            message = message_que.get()
+            self.send_message(conn, message)
 
     def handle_commits(self):
         while True:
@@ -72,15 +118,16 @@ class Node:
 
     def handle_connection(self, conn, addr):
         try:
-            header = self.recv_exact(conn, 128)
-            if header is None:
-                return
-            msg_len = int(header.decode().strip())
-            buffer = self.recv_exact(conn, msg_len)
-            if buffer is None:
-                return
-            msg = json.loads(buffer.decode())
-            self.process_msg(msg, conn, addr)
+            while True:
+                header = self.recv_exact(conn, 128)
+                if header is None:
+                    return
+                msg_len = int(header.decode().strip())
+                buffer = self.recv_exact(conn, msg_len)
+                if buffer is None:
+                    return
+                msg = json.loads(buffer.decode())
+                self.process_msg(msg, conn, addr)
         except Exception as e:
             print(f"Node {self.id} handle_connection error: {e}")
         finally:
@@ -134,7 +181,7 @@ class Node:
                         self.state = "leader"
                         self.leader_id = self.id
                         self.heartbeat_event.set()
-                        print(f"Node {self.id} je postao LIDER u term-u {self.current_term}")
+                        print(f"Node {self.id} became the leader in term {self.current_term}")
             case "AppendEntries":
                 if msg["term"] >= self.current_term:
                     with self.lock:
@@ -204,18 +251,15 @@ class Node:
                                 self.commit_index = min(msg["leader_commit"], len(self.log))
 
 
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect(CLUSTER[msg["leader_id"]])
-                    self.send_message(sock, append_entries_response)
-                    sock.close()
+                    leader_id = msg["leader_id"]
+                    self.peer_queues[leader_id].put(append_entries_response)
+                        
                 else:
                     append_entries_response = AppendEntriesResponse(node_id = self.id)
                     append_entries_response.success = False
                     append_entries_response.term = self.current_term
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect(CLUSTER[msg["leader_id"]])
-                    self.send_message(sock, append_entries_response)
-                    sock.close()
+                    leader_id = msg["leader_id"]
+                    self.peer_queues[leader_id].put(append_entries_response)
 
             case "AppendEntriesResponse":
                 self.handle_response(msg)
@@ -227,7 +271,7 @@ class Node:
             if self.state == "leader":
                 time.sleep(0.05)
                 continue
-            timeout = random.uniform(0.15, 0.3)
+            timeout = random.uniform(0.5, 1.0)
             heartbeat_received = self.heartbeat_event.wait(timeout)
             if heartbeat_received:
                 with self.lock:
@@ -244,7 +288,7 @@ class Node:
                         last_log_term = 0
                     self.current_term += 1
                     self.state = "candidate"
-                    print(f"Kandidujem se: {self.id}")
+                    print(f"{self.id} became a candidate")
                     self.voted_for = self.id
                     self.voted_for_me_total = 1
 
@@ -253,10 +297,7 @@ class Node:
                 for i in CLUSTER:
                     try:
                         if i != self.id:
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.connect(CLUSTER[i])
-                            self.send_message(sock, req)
-                            sock.close()
+                            self.peer_queues[i].put(req)
                     except:
                         pass
 
@@ -311,20 +352,19 @@ class Node:
                     my_vote.term = vote_term
                     my_vote.response = True             
 
-        print(f"Moj glas za {msg["node_id"]} je {my_vote.response}")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(CLUSTER[msg["node_id"]])
-        self.send_message(sock, my_vote)
-        sock.close()
+        print(f"My vote for {msg["node_id"]} is {my_vote.response}")
+        node_id = msg["node_id"]
+        self.peer_queues[node_id].put(my_vote)
 
     def heartbeat_loop(self):
         while True:
             if self.state == "leader":
-                heartbeat = AppendEntries(leader_id = self.id, term = self.current_term)
 
-                heartbeat.leader_commit = self.commit_index
 
                 for i in CLUSTER:
+                    heartbeat = AppendEntries(leader_id = self.id, term = self.current_term)
+
+                    heartbeat.leader_commit = self.commit_index
                     try:
                         if i != self.id:
                             with self.lock:
@@ -338,10 +378,7 @@ class Node:
                                 except:
                                     heartbeat.prev_log_term = 0
                                 
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.connect(CLUSTER[i])
-                            self.send_message(sock, heartbeat)
-                            sock.close()
+                            self.peer_queues[i].put(heartbeat)
                     except:
                         pass
 
@@ -378,7 +415,7 @@ class Node:
                 return
             else:
                 if node_log_length > 0:
-                    print(f"SUCCESS od node {node_id}, last_log_index={node_log_length}")
+                    print(f"SUCCESS from node {node_id}, last_log_index={node_log_length}")
                 self.match_index[node_id] = max(node_log_length, self.match_index.get(node_id, 0))
                 self.next_index[node_id] = self.match_index[node_id] + 1
                 self.try_advance_commit()
@@ -425,16 +462,16 @@ class Node:
                     log_entry = LogEntry(term = self.current_term, index = len(self.log) + 1, command = {"type": "DEL", "key": msg["key"]})
                     self.log.append(log_entry)
 
-                print(f"Dodat log u listu za commit: {log_entry.command}")
-                self.send_raw(conn, json.dumps({"response": "ok"}))
+                print(f"Added to the list of commits: {log_entry.command}")
+                self.send_raw(conn, json.dumps({"status": "ok"}))
 
             case "SET":
                 with self.lock:
                     log_entry = LogEntry(term = self.current_term, index = len(self.log) + 1, command = {"type": "SET", "key": msg["key"], "value": msg["value"]})
                     self.log.append(log_entry)
 
-                print(f"Dodat log u listu za commit: {log_entry.command}")
-                self.send_raw(conn, json.dumps({"response": "ok"}))
+                print(f"Added to the list of commits: {log_entry.command}")
+                self.send_raw(conn, json.dumps({"status": "ok"}))
         
 
 
