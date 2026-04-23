@@ -31,6 +31,7 @@ class Node:
 
     def start(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         ADRESA = CLUSTER[self.id]
         self.server.bind(ADRESA)
         self.server.listen()
@@ -424,6 +425,8 @@ class Node:
     def try_advance_commit(self):
         length = len(self.log)
         for l in range(length, self.commit_index, -1):
+            if self.log[l-1].term != self.current_term:
+                continue
             counter = 1
             for i in self.match_index:
                 if self.match_index[i] >= l:
