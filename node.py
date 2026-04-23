@@ -302,6 +302,8 @@ class Node:
                     except:
                         pass
 
+    #Voting mechanism
+
     def vote(self, msg):
         with self.lock:
             my_vote = VoteResponse(node_id=self.id, term=self.current_term, response=False)
@@ -428,6 +430,7 @@ class Node:
             if self.log[l-1].term != self.current_term:
                 continue
             counter = 1
+
             for i in self.match_index:
                 if self.match_index[i] >= l:
                     counter += 1
