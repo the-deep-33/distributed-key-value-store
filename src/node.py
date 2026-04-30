@@ -41,6 +41,8 @@ class Node:
             if data:
                 self.current_term = data["current_term"]
                 self.voted_for = data["voted_for"]
+                self.commit_index = data.get("commit_index", 0)
+                    
         except:
             pass
         file_log_name = "node_" + str(self.id) + "_logs.jsonl"
@@ -54,8 +56,18 @@ class Node:
                     data = json.loads(data_raw)
                     self.log.append(LogEntry(**data))
                     self.byte_offsets.append(offset)
-        except:
-            pass
+
+            for i in range(self.commit_index):
+                cmd = self.log[i].command
+                match cmd["type"]:
+                    case "SET":
+                        self.store[cmd["key"]] = cmd["value"]
+                    case "DEL":
+                        self.store.pop(cmd["key"], None)
+                        
+            self.last_applied = self.commit_index
+        except Exception as e:
+            print(f"Error: {e}")
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         ADRESA = CLUSTER[self.id]
@@ -117,7 +129,7 @@ class Node:
         
     def save_state(self):
         file_name = "node_" + str(self.id) + ".json"
-        state_dict = {"current_term": self.current_term, "voted_for": self.voted_for}
+        state_dict = {"current_term": self.current_term, "voted_for": self.voted_for, "commit_index": self.commit_index}
         with open(os.path.join(DATA_DIR, file_name), 'w') as file:
             json.dump(state_dict, file)
 
@@ -285,6 +297,7 @@ class Node:
 
                                 if msg["leader_commit"] > self.commit_index:
                                     self.commit_index = min(msg["leader_commit"], len(self.log))
+                                    self.save_state()
                             except Exception as e:
                                 print(f"Error: {e}")
                                 append_entries_response.success = False
@@ -300,6 +313,7 @@ class Node:
 
                             if msg["leader_commit"] > self.commit_index:
                                 self.commit_index = min(msg["leader_commit"], len(self.log))
+                                self.save_state()
                         
                     else:
                         my_index = msg["prev_log_index"]
@@ -318,12 +332,14 @@ class Node:
                             append_entries_response.last_log_term = self.log[-1].term
                             if msg["leader_commit"] > self.commit_index:
                                 self.commit_index = min(msg["leader_commit"], len(self.log))
+                                self.save_state()
                         
 
                 append_entries_response.term = self.current_term
                 if append_entries_response.success == True:
                     if msg["leader_commit"] > self.commit_index:
                         self.commit_index = min(msg["leader_commit"], len(self.log))
+                        self.save_state()
 
 
             leader_id = msg["leader_id"]
@@ -492,6 +508,7 @@ class Node:
                 
             if counter > len(CLUSTER) // 2:
                 self.commit_index = l
+                self.save_state()
                 return
 
             
