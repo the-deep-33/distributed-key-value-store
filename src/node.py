@@ -9,6 +9,9 @@ import json
 from dataclasses import asdict
 import random
 import time
+import os
+
+DATA_DIR = os.environ.get("DATA_DIR", ".")
 
 @dataclass
 class Node:
@@ -28,8 +31,31 @@ class Node:
     voted_for_me_total: int = 0
     voted_for: int = None
     peer_queues: dict = field(default_factory = dict)
+    byte_offsets: list = field(default_factory = list)
 
     def start(self):
+        file_name = "node_" + str(self.id) + ".json"
+        try:
+            with open(os.path.join(DATA_DIR, file_name), 'r') as file:
+                data = json.load(file)
+            if data:
+                self.current_term = data["current_term"]
+                self.voted_for = data["voted_for"]
+        except:
+            pass
+        file_log_name = "node_" + str(self.id) + "_logs.jsonl"
+        try:
+            with open(os.path.join(DATA_DIR, file_log_name), 'r') as file:
+                while True:
+                    offset = file.tell()
+                    data_raw = file.readline()
+                    if not data_raw:
+                        break
+                    data = json.loads(data_raw)
+                    self.log.append(LogEntry(**data))
+                    self.byte_offsets.append(offset)
+        except:
+            pass
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         ADRESA = CLUSTER[self.id]
@@ -88,6 +114,33 @@ class Node:
             return peer
         except:
             return None
+        
+    def save_state(self):
+        file_name = "node_" + str(self.id) + ".json"
+        state_dict = {"current_term": self.current_term, "voted_for": self.voted_for}
+        with open(os.path.join(DATA_DIR, file_name), 'w') as file:
+            json.dump(state_dict, file)
+
+    def append_log(self, index):
+        file_log_name = "node_" + str(self.id) + "_logs.jsonl"
+        log_dict = asdict(self.log[index])
+        
+        with open(os.path.join(DATA_DIR, file_log_name), 'a') as file:
+            self.byte_offsets.append(file.tell())
+            file.write(json.dumps(log_dict) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+    def truncate_log(self, index):
+        file_log_name = "node_" + str(self.id) + "_logs.jsonl"
+        with open(os.path.join(DATA_DIR, file_log_name), 'r+') as file:
+            file.seek(self.byte_offsets[index])
+            file.truncate()
+        self.byte_offsets = self.byte_offsets[:index]
+        self.log = self.log[:index]
+        
+
+            
         
     def send_queue_messages(self, conn, message_que):
         while True:
@@ -162,110 +215,126 @@ class Node:
             case "RequestVote":
                 self.vote(msg)
             case "VoteResponse":
-                with self.lock:
-                    vote_term = msg["term"]
-                    if vote_term > self.current_term:
-                        self.current_term = vote_term
-                        self.state = "follower"
-                        self.voted_for = None
-                        return
-                    if vote_term < self.current_term:
-                        return
-                    vote_response = msg["response"]
-                    if vote_response:
-                        self.voted_for_me_total += 1
-                    if self.voted_for_me_total > len(CLUSTER) // 2 and self.state == "candidate":
-                        for i in CLUSTER:
-                            if i != self.id:
-                                self.next_index[i] = len(self.log) + 1
-                                self.match_index[i] = 0
-                        self.state = "leader"
-                        self.leader_id = self.id
-                        self.heartbeat_event.set()
-                        print(f"Node {self.id} became the leader in term {self.current_term}")
+                self.handle_vote_response(msg)
             case "AppendEntries":
-                if msg["term"] >= self.current_term:
-                    with self.lock:
-                        self.heartbeat_event.set()
-                        self.state = "follower"
-                        self.leader_id = msg["leader_id"]
-                        self.current_term = msg["term"]
-                        append_entries_response = AppendEntriesResponse(node_id = self.id, success = True)
-                        
-
-                        if msg["entries"]:
-                            if self.log:
-                                my_index = msg["prev_log_index"]
-                                my_term = msg["prev_log_term"]
-                                if len(self.log) < my_index:
-                                    append_entries_response.success = False
-                                    append_entries_response.last_log_index = len(self.log)
-
-                                elif self.log[my_index - 1].term != my_term:
-                                    append_entries_response.success = False
-                                    append_entries_response.last_log_index = my_index - 1
-
-                                elif len(self.log) > my_index:
-                                    self.log = self.log[:my_index]
-                                    append_entries_response.success = True
-
-                                    dictionary_logs = msg["entries"]
-                                    for l in dictionary_logs:
-                                        self.log.append(LogEntry(**l))
-
-                                    append_entries_response.last_log_index = self.log[-1].index
-
-                                    if msg["leader_commit"] > self.commit_index:
-                                        self.commit_index = min(msg["leader_commit"], len(self.log))
-
-                                else:
-                                    append_entries_response.success = True
-                                    append_entries_response.last_log_index = self.log[-1].index
-                                    dictionary_logs = msg["entries"]
-                                    for l in dictionary_logs:
-                                        self.log.append(LogEntry(**l))
-
-                                    if msg["leader_commit"] > self.commit_index:
-                                        self.commit_index = min(msg["leader_commit"], len(self.log))
-                                
-                            else:
-                                my_index = msg["prev_log_index"]
-                                if my_index > 0:
-                                    append_entries_response.success = False
-                                    append_entries_response.last_log_index = 0
-                                else:
-                                    append_entries_response.success = True
-
-                                    dictionary_logs = msg["entries"]
-                                    for l in dictionary_logs:
-                                        self.log.append(LogEntry(**l))
-
-                                    append_entries_response.last_log_index = self.log[-1].index
-                                    append_entries_response.last_log_term = self.log[-1].term
-                                    if msg["leader_commit"] > self.commit_index:
-                                        self.commit_index = min(msg["leader_commit"], len(self.log))
-                                
-
-                        append_entries_response.term = self.current_term
-                        if append_entries_response.success == True:
-                            if msg["leader_commit"] > self.commit_index:
-                                self.commit_index = min(msg["leader_commit"], len(self.log))
-
-
-                    leader_id = msg["leader_id"]
-                    self.peer_queues[leader_id].put(append_entries_response)
-                        
-                else:
-                    append_entries_response = AppendEntriesResponse(node_id = self.id)
-                    append_entries_response.success = False
-                    append_entries_response.term = self.current_term
-                    leader_id = msg["leader_id"]
-                    self.peer_queues[leader_id].put(append_entries_response)
-
+                self.handle_append_entries(msg)
             case "AppendEntriesResponse":
-                self.handle_response(msg)
+                self.handle_append_entries_response(msg)
             case "ClientCommand":
                 self.process_command(msg, conn, addr)
+
+    def handle_vote_response(self, msg):
+        with self.lock:
+            vote_term = msg["term"]
+            if vote_term > self.current_term:
+                self.current_term = vote_term
+                self.state = "follower"
+                self.voted_for = None
+                self.save_state()
+                return
+            if vote_term < self.current_term:
+                return
+            vote_response = msg["response"]
+            if vote_response:
+                self.voted_for_me_total += 1
+            if self.voted_for_me_total > len(CLUSTER) // 2 and self.state == "candidate":
+                for i in CLUSTER:
+                    if i != self.id:
+                        self.next_index[i] = len(self.log) + 1
+                        self.match_index[i] = 0
+                self.state = "leader"
+                self.leader_id = self.id
+                self.heartbeat_event.set()
+                print(f"Node {self.id} became the leader in term {self.current_term}")
+
+    def handle_append_entries(self, msg):
+        if msg["term"] >= self.current_term:
+            with self.lock:
+                self.heartbeat_event.set()
+                self.state = "follower"
+                self.leader_id = msg["leader_id"]
+                if msg["term"] > self.current_term: 
+                    self.current_term = msg["term"]
+                    self.save_state()
+                append_entries_response = AppendEntriesResponse(node_id = self.id, success = True)
+                
+
+                if msg["entries"]:
+                    if self.log:
+                        my_index = msg["prev_log_index"]
+                        my_term = msg["prev_log_term"]
+                        if len(self.log) < my_index:
+                            append_entries_response.success = False
+                            append_entries_response.last_log_index = len(self.log)
+
+                        elif self.log[my_index - 1].term != my_term:
+                            append_entries_response.success = False
+                            append_entries_response.last_log_index = my_index - 1
+
+                        elif len(self.log) > my_index:
+                            try:
+                                append_entries_response.success = True
+                                self.truncate_log(my_index)
+
+                                dictionary_logs = msg["entries"]
+                                for l in dictionary_logs:
+                                    self.log.append(LogEntry(**l))
+                                    self.append_log(len(self.log) - 1)
+
+                                append_entries_response.last_log_index = self.log[-1].index
+
+                                if msg["leader_commit"] > self.commit_index:
+                                    self.commit_index = min(msg["leader_commit"], len(self.log))
+                            except Exception as e:
+                                print(f"Error: {e}")
+                                append_entries_response.success = False
+                                
+
+                        else:
+                            append_entries_response.success = True
+                            append_entries_response.last_log_index = self.log[-1].index
+                            dictionary_logs = msg["entries"]
+                            for l in dictionary_logs:
+                                self.log.append(LogEntry(**l))
+                                self.append_log(len(self.log) - 1)
+
+                            if msg["leader_commit"] > self.commit_index:
+                                self.commit_index = min(msg["leader_commit"], len(self.log))
+                        
+                    else:
+                        my_index = msg["prev_log_index"]
+                        if my_index > 0:
+                            append_entries_response.success = False
+                            append_entries_response.last_log_index = 0
+                        else:
+                            append_entries_response.success = True
+
+                            dictionary_logs = msg["entries"]
+                            for l in dictionary_logs:
+                                self.log.append(LogEntry(**l))
+                                self.append_log(len(self.log) - 1)
+
+                            append_entries_response.last_log_index = self.log[-1].index
+                            append_entries_response.last_log_term = self.log[-1].term
+                            if msg["leader_commit"] > self.commit_index:
+                                self.commit_index = min(msg["leader_commit"], len(self.log))
+                        
+
+                append_entries_response.term = self.current_term
+                if append_entries_response.success == True:
+                    if msg["leader_commit"] > self.commit_index:
+                        self.commit_index = min(msg["leader_commit"], len(self.log))
+
+
+            leader_id = msg["leader_id"]
+            self.peer_queues[leader_id].put(append_entries_response)
+                
+        else:
+            append_entries_response = AppendEntriesResponse(node_id = self.id)
+            append_entries_response.success = False
+            append_entries_response.term = self.current_term
+            leader_id = msg["leader_id"]
+            self.peer_queues[leader_id].put(append_entries_response)
 
     def election_loop(self):
         while True:
@@ -292,6 +361,7 @@ class Node:
                     print(f"{self.id} became a candidate")
                     self.voted_for = self.id
                     self.voted_for_me_total = 1
+                    self.save_state()
 
                     req = RequestVote(node_id = self.id, term = self.current_term, last_log_index = last_log_index, last_log_term = last_log_term)
 
@@ -314,50 +384,34 @@ class Node:
                 my_vote.response = False
             elif vote_term == self.current_term:
                 if self.voted_for == None:
-                    if self.log:
-                        my_last_index = self.log[-1].index
-                        my_last_term = self.log[-1].term
-
-                        if (my_last_term > vote_last_log_term) or (my_last_term  == vote_last_log_term and my_last_index > vote_last_log_index):
-                            my_vote.response = False
-                        else:
-                            my_vote.term = vote_term
-                            self.state = "follower"
-                            self.current_term = vote_term
-                            self.voted_for = msg["node_id"]
-                            my_vote.response = True
-                    else:
-                        self.state = "follower"
-                        self.current_term = vote_term
-                        self.voted_for = msg["node_id"]
-                        my_vote.term = vote_term
-                        my_vote.response = True   
+                    my_vote = self.vote_helper(msg["node_id"], my_vote, vote_term, vote_last_log_index, vote_last_log_term) 
                 else:
                     my_vote.response = False
             else:
-                if self.log:
-                    my_last_index = self.log[-1].index
-                    my_last_term = self.log[-1].term
-
-                    if (my_last_term > vote_last_log_term) or (my_last_term  == vote_last_log_term and my_last_index > vote_last_log_index):
-                        my_vote.response = False
-                    else:
-                        my_vote.term = vote_term
-                        self.state = "follower"
-                        self.current_term = vote_term
-                        self.voted_for = msg["node_id"]
-                        my_vote.response = True
-
-                else:
-                    self.state = "follower"
-                    self.current_term = vote_term
-                    self.voted_for = msg["node_id"]
-                    my_vote.term = vote_term
-                    my_vote.response = True             
+                my_vote = self.vote_helper(msg["node_id"], my_vote, vote_term, vote_last_log_index, vote_last_log_term)          
 
         print(f"My vote for {msg["node_id"]} is {my_vote.response}")
         node_id = msg["node_id"]
         self.peer_queues[node_id].put(my_vote)
+
+    def vote_helper(self, candidate_id, my_vote, vote_term, vote_last_log_index, vote_last_log_term):
+        if self.log:
+            my_last_index = self.log[-1].index
+            my_last_term = self.log[-1].term
+
+            if (my_last_term > vote_last_log_term) or (my_last_term  == vote_last_log_term and my_last_index > vote_last_log_index):
+                my_vote.response = False
+                return my_vote
+
+        my_vote.term = vote_term
+        self.state = "follower"
+        self.current_term = vote_term
+        self.voted_for = candidate_id
+        self.save_state()
+        my_vote.response = True
+
+        return my_vote 
+
 
     def heartbeat_loop(self):
         while True:
@@ -397,7 +451,7 @@ class Node:
         conn.sendall(length_to_send)
         conn.sendall(raw_json_str.encode())
 
-    def handle_response(self, msg):
+    def handle_append_entries_response(self, msg):
         with self.lock:
             if self.state != "leader":
                 return
@@ -406,6 +460,7 @@ class Node:
                 self.current_term = response_term
                 self.state = "follower"
                 self.voted_for = None
+                self.save_state()
                 return
             elif response_term < self.current_term:
                 return
@@ -467,6 +522,7 @@ class Node:
                 with self.lock:
                     log_entry = LogEntry(term = self.current_term, index = len(self.log) + 1, command = {"type": "DEL", "key": msg["key"]})
                     self.log.append(log_entry)
+                    self.append_log(len(self.log) - 1)
 
                 print(f"Added to the list of commits: {log_entry.command}")
                 self.send_raw(conn, json.dumps({"status": "ok"}))
@@ -475,6 +531,7 @@ class Node:
                 with self.lock:
                     log_entry = LogEntry(term = self.current_term, index = len(self.log) + 1, command = {"type": "SET", "key": msg["key"], "value": msg["value"]})
                     self.log.append(log_entry)
+                    self.append_log(len(self.log) - 1)
 
                 print(f"Added to the list of commits: {log_entry.command}")
                 self.send_raw(conn, json.dumps({"status": "ok"}))
